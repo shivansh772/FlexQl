@@ -1,12 +1,12 @@
 # FlexQL Design Document
 
-Repository link: add your GitHub repository URL here before submission.
+Repository link: https://github.com/shivansh772/FlexQl
 
 ## Overview
 
 FlexQL is implemented as a client-server system in C/C++. The client exposes the required C API and a small interactive REPL. The server accepts SQL-like statements over TCP, executes them in an in-memory engine, and returns rows back to the client.
 
-This submission intentionally runs the server in single-threaded mode because that matches the current target machine constraints. The design still separates networking and execution cleanly so a threaded accept loop can be added later without changing the public API.
+The server accepts multiple simultaneous client connections. Each accepted socket is handled on its own worker thread while all threads share the same engine instance.
 
 ## Storage Design
 
@@ -32,18 +32,28 @@ Schema enforcement:
 Persistence format:
 
 - `<TABLE>.schema` stores one `column|type` pair per line.
-- `<TABLE>.rows` stores `active|expires_at|value_count|value1|value2|...`.
+- `<TABLE>.data` stores the latest compact checkpoint snapshot of the table.
+- `<TABLE>.wal` stores `active|expires_at|value_count|value1|value2|...`.
 - Values are escaped so delimiters can be stored safely.
+
+Recovery model:
+
+- On startup, FlexQL loads `<TABLE>.schema`.
+- It then restores rows from `<TABLE>.data` if a checkpoint exists.
+- Finally it replays `<TABLE>.wal` to recover writes that happened after the checkpoint.
+- Periodic checkpoints compact the in-memory table back to `<TABLE>.data` and reset the WAL, which prevents unbounded replay time.
 
 ## Supported Types
 
+- `INT`
 - `DECIMAL`
 - `VARCHAR`
+- `DATETIME`
 
 Implementation note:
 
 - `INT` is accepted and normalized internally to `DECIMAL` so example SQL still works.
-- `DATETIME` is not implemented because it was optional.
+- `DATETIME` values are validated using the format `YYYY-MM-DD HH:MM:SS`.
 
 ## Query Execution
 
@@ -53,11 +63,15 @@ Creates a table and stores the schema in memory.
 
 ### INSERT
 
-Appends a row to the target table. Each inserted row is automatically assigned:
+Appends one or more rows to the target table. Batch inserts are supported using:
 
-- `expires_at = current_time + 24 hours`
+- `INSERT INTO T VALUES (...),(...),(...);`
 
-The expiration field is metadata and is not exposed as a normal SQL column.
+Expiration handling is driven by an `EXPIRES_AT` column when the table defines one.
+
+- `EXPIRES_AT = 0` means the row never expires.
+- Positive `EXPIRES_AT` values are treated as Unix timestamps.
+- Tables without `EXPIRES_AT` default rows to non-expiring.
 
 ### SELECT
 
@@ -81,6 +95,10 @@ Only one condition is supported. The implementation accepts:
 - `>`
 - `>=`
 
+### DROP TABLE
+
+`DROP TABLE table_name` removes the table from memory, closes its WAL stream, and deletes the persisted `.schema`, `.data`, and `.wal` files from disk.
+
 ## Indexing
 
 Primary indexing is implemented on the first column of each table.
@@ -95,20 +113,20 @@ This gives expected O(1) lookup for equality queries on the indexed column.
 
 Every row stores an expiration timestamp.
 
-- Expired rows are lazily marked inactive before inserts and reads.
+- Expired rows are filtered out during reads.
 - Inactive rows are skipped by `SELECT` and `JOIN`.
 - This avoids scanning a separate expiration table and keeps the implementation compact.
-- The current row state is written back to disk after table creation and inserts.
+- The expiration metadata is persisted inside the WAL row record.
 
 ## Caching Strategy
 
 An LRU-style cache structure is implemented for query results.
 
-- Capacity is fixed at 32 result sets.
+- Capacity is fixed at 256 result sets.
 - A list stores recency order.
 - A hash map points to cache entries.
-
-Per the assignment-specific instruction for this submission, the engine updates the cache after `SELECT` execution but does not consult the cache before executing a new query. That keeps the cache mechanism present and correctly maintained while preserving the required behavior.
+- `SELECT` checks the cache before executing repeated queries.
+- `CREATE TABLE`, `INSERT`, and `DROP TABLE` invalidate affected cache entries.
 
 ## Networking Protocol
 
@@ -123,17 +141,27 @@ This keeps the wire format simple and safe for values containing spaces.
 
 ## Multithreading Design
 
-The server in this submission is single-threaded.
+The server uses one thread per client connection.
 
-- It accepts one connection at a time.
-- A connected client can send multiple SQL statements over the same socket.
-- Shared state is therefore accessed serially, so locking is not needed in the current build.
+- The accept loop remains in the main thread.
+- Each accepted client socket is handed to a detached worker thread.
+- All workers share one `Engine` instance.
+- The engine protects table metadata with a shared mutex:
+  - `SELECT` takes a shared lock.
+  - `CREATE TABLE`, `INSERT`, and `DROP TABLE` take an exclusive lock.
+- The query cache is protected by a separate mutex.
 
-If multithreading is enabled later, the natural extension is:
+This allows multiple clients to stay connected and execute work safely at the same time while preserving correctness for writes and schema changes.
 
-- one thread per client or a worker pool
-- mutex protection around table and index structures
-- read/write locking for concurrent reads
+## Durability And Recovery
+
+FlexQL uses a write-ahead log plus periodic checkpoints.
+
+- New rows are appended to the WAL before the in-memory table/index state is updated.
+- After enough writes, the engine writes a fresh checkpoint file and truncates the WAL.
+- On graceful shutdown, the engine checkpoints all tables so restart time stays short.
+
+This is more fault-tolerant than pure in-memory storage because persisted state survives process restarts and partial history is recoverable from the WAL. It is still a teaching implementation rather than a production-grade database, so it does not yet implement full fsync tuning, checksums, or crash-consistent background checkpoint scheduling.
 
 ## API Design
 
@@ -206,4 +234,4 @@ Included benchmark support:
 - A sample recorded run is included in `PERFORMANCE.md`.
 - The exact provided `benchmark_flexql.cpp` has also been integrated under `benchmarks/benchmark_flexql.cpp` and built as `build/benchmark`.
 
-For a 10 million row benchmark, the next improvements would be batched network requests, chunked storage allocation, and more efficient join processing.
+For a 10 million row benchmark, the next improvements would be larger storage preallocation, more efficient join processing, and compaction for long WAL histories.

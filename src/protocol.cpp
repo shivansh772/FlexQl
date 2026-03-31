@@ -153,4 +153,4 @@ bool receive_response(int fd, ExecuteResult &response) {
     return true;
 }
 
-}  // namespace flexql
+}

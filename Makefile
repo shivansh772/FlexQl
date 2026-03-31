@@ -18,7 +18,7 @@ EXAMPLE_BIN := $(BUILD_DIR)/api_example
 BENCH_BIN := $(BUILD_DIR)/flexql-benchmark
 BENCHMARK_COMPAT_BIN := $(BUILD_DIR)/benchmark
 
-.PHONY: all clean clean-data
+.PHONY: all clean clean-data benchmark-run benchmark-run-compat benchmark-unit-test
 
 all: $(SERVER_BIN) $(CLIENT_BIN) $(EXAMPLE_BIN) $(BENCH_BIN) $(BENCHMARK_COMPAT_BIN)
 
@@ -47,3 +47,12 @@ clean-data:
 	rm -rf data/tables/*
 	mkdir -p data/tables
 	touch data/tables/.gitkeep
+
+benchmark-run: all
+	./scripts/run_benchmark.sh --api
+
+benchmark-run-compat: all
+	./scripts/run_benchmark.sh --compat
+
+benchmark-unit-test: all
+	./scripts/run_benchmark.sh --unit-test

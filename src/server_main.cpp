@@ -1,11 +1,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #include <string>
 
 #include "engine.hpp"
@@ -27,7 +29,7 @@ void handle_client(int client_fd, flexql::Engine &engine) {
     close(client_fd);
 }
 
-}  // namespace
+}
 
 int main(int argc, char **argv) {
     const int port = (argc >= 2) ? std::atoi(argv[1]) : 9000;
@@ -63,7 +65,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "FlexQL server listening on port " << port << "\n";
-    std::cout << "Server mode: single-threaded event loop\n";
+    std::cout << "Server mode: multithreaded (one thread per client)\n";
 
     flexql::Engine engine;
     while (true) {
@@ -73,7 +75,11 @@ int main(int argc, char **argv) {
         if (client_fd < 0) {
             continue;
         }
-        handle_client(client_fd, engine);
+        std::thread([client_fd, &engine]() {
+            int nodelay = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            handle_client(client_fd, engine);
+        }).detach();
     }
 
     close(server_fd);

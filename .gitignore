@@ -1,3 +1,4 @@
+.codex
 build/
 data/tables/*
 !data/tables/.gitkeep

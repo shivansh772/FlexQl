@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -25,7 +26,7 @@ char *dup_cstr(const std::string &text) {
     return copy;
 }
 
-}  // namespace
+}
 
 extern "C" {
 
@@ -54,6 +55,8 @@ int flexql_open(const char *host, int port, FlexQL **db) {
             continue;
         }
         if (connect(socket_fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            int nodelay = 1;
+            setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
             break;
         }
         close(socket_fd);
@@ -144,4 +147,4 @@ void flexql_free(void *ptr) {
     std::free(ptr);
 }
 
-}  // extern "C"
+}

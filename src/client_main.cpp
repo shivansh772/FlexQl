@@ -14,7 +14,7 @@ int print_row(void *, int column_count, char **values, char **column_names) {
     return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char **argv) {
     const char *host = argc >= 2 ? argv[1] : "127.0.0.1";

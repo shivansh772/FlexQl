@@ -7,6 +7,8 @@
 
 namespace {
 
+constexpr int kInsertBatchSize = 250;
+
 int count_rows(void *data, int, char **, char **) {
     int *count = static_cast<int *>(data);
     ++(*count);
@@ -24,7 +26,12 @@ bool exec_or_print(FlexQL *db, const std::string &sql) {
     return true;
 }
 
-}  // namespace
+void append_row_values(std::string &sql, int row_id) {
+    sql += "(" + std::to_string(row_id) + ", 'user_" + std::to_string(row_id) + "', " +
+           std::to_string(row_id % 100) + ")";
+}
+
+}
 
 int main(int argc, char **argv) {
     const char *host = argc >= 2 ? argv[1] : "127.0.0.1";
@@ -46,12 +53,18 @@ int main(int argc, char **argv) {
     }
 
     const auto insert_start = std::chrono::steady_clock::now();
-    for (int i = 1; i <= rows; ++i) {
-        if (!exec_or_print(
-                db,
-                "INSERT INTO " + table + " VALUES (" + std::to_string(i) + ", 'user_" +
-                    std::to_string(i) + "', " + std::to_string(i % 100) + ");"
-            )) {
+    for (int start = 1; start <= rows; start += kInsertBatchSize) {
+        const int end = std::min(start + kInsertBatchSize - 1, rows);
+        std::string sql = "INSERT INTO " + table + " VALUES ";
+        for (int i = start; i <= end; ++i) {
+            if (i > start) {
+                sql += ",";
+            }
+            append_row_values(sql, i);
+        }
+        sql += ";";
+
+        if (!exec_or_print(db, sql)) {
             flexql_close(db);
             return 1;
         }

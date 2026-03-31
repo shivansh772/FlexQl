@@ -17,6 +17,6 @@ This file records one verified benchmark run using the included benchmark execut
 
 ## Interpretation
 
-- Inserts are currently the slowest path because each insert is sent as its own network request and is also persisted to disk immediately.
+- Inserts are currently the slowest path because each insert is persisted to disk and checkpoint/WAL management adds overhead.
 - Indexed single-row lookup works correctly and returns one row using the primary-key index.
-- For larger leaderboard-style runs, the most important optimizations would be batching inserts, reducing disk flush overhead, and improving join execution.
+- For larger leaderboard-style runs, the most important optimizations would be larger batch sizes, lower-overhead checkpoint scheduling, and improving join execution.

@@ -16,6 +16,6 @@ bool receive_request(int fd, std::string &sql);
 bool send_response(int fd, const ExecuteResult &response);
 bool receive_response(int fd, ExecuteResult &response);
 
-}  // namespace flexql
+}
 
 #endif
