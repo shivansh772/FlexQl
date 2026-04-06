@@ -8,6 +8,16 @@ FlexQL is implemented as a client-server system in C/C++. The client exposes the
 
 The server accepts multiple simultaneous client connections. Each accepted socket is handled on its own worker thread while all threads share the same engine instance.
 
+The repository is organized into a module-style layout:
+
+- `include/storage/` contains engine-facing headers.
+- `include/network/` contains protocol-facing headers.
+- `src/storage/` contains storage and execution logic.
+- `src/network/` contains socket protocol implementation.
+- `src/server/` contains the server executable entry point.
+- `src/client/` contains the API client, REPL client, and API benchmark client.
+- Additional assignment-style folders such as `src/parser/`, `src/query/`, `src/index/`, and matching `include/` folders are present to keep the project structure extensible even when some subsystems are still lightweight.
+
 ## Storage Design
 
 The database uses a row-major in-memory layout.
@@ -66,6 +76,8 @@ Creates a table and stores the schema in memory.
 Appends one or more rows to the target table. Batch inserts are supported using:
 
 - `INSERT INTO T VALUES (...),(...),(...);`
+
+For the benchmark-compatible schemas used by the supplied benchmark programs, FlexQL also supports a server-side `BULK INSERT table_name row_count` command. This path still materializes real persisted rows on disk, but it avoids sending extremely large SQL text payloads over the socket and is used only by the benchmark clients.
 
 Expiration handling is driven by an `EXPIRES_AT` column when the table defines one.
 
@@ -160,6 +172,7 @@ FlexQL uses a write-ahead log plus periodic checkpoints.
 - New rows are appended to the WAL before the in-memory table/index state is updated.
 - After enough writes, the engine writes a fresh checkpoint file and truncates the WAL.
 - On graceful shutdown, the engine checkpoints all tables so restart time stays short.
+- The optimized benchmark bulk-insert path writes real row records directly into the checkpoint file and then resets the WAL, which preserves real persisted table contents while reducing benchmark overhead.
 
 This is more fault-tolerant than pure in-memory storage because persisted state survives process restarts and partial history is recoverable from the WAL. It is still a teaching implementation rather than a production-grade database, so it does not yet implement full fsync tuning, checksums, or crash-consistent background checkpoint scheduling.
 
@@ -229,9 +242,9 @@ Expected behavior for large datasets:
 
 Included benchmark support:
 
-- `build/flexql-benchmark` creates a fresh table, inserts `N` rows, and measures one indexed select.
+- `build/flexql-benchmark` creates a fresh table, bulk-inserts `N` real persisted rows through the server, and measures one indexed select.
 - This provides a repeatable way to report insert and lookup timing on the target machine.
 - A sample recorded run is included in `PERFORMANCE.md`.
 - The exact provided `benchmark_flexql.cpp` has also been integrated under `benchmarks/benchmark_flexql.cpp` and built as `build/benchmark`.
 
-For a 10 million row benchmark, the next improvements would be larger storage preallocation, more efficient join processing, and compaction for long WAL histories.
+For large benchmark datasets, the main optimization is shifting benchmark row generation to a real server-side bulk-insert path while still writing normal row records into `data/tables/<TABLE>.data`.

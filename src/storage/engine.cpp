@@ -1,4 +1,4 @@
-#include "engine.hpp"
+#include "storage/engine.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -194,6 +194,90 @@ bool parse_row_line(const std::string &line, Row &row) {
     return true;
 }
 
+bool parse_size_value(const std::string &s, std::size_t &value) {
+    const std::string trimmed = trim(s);
+    if (trimmed.empty()) {
+        return false;
+    }
+    unsigned long long parsed = 0;
+    auto [ptr, ec] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), parsed);
+    if (ec != std::errc() || ptr != trimmed.data() + trimmed.size()) {
+        return false;
+    }
+    value = static_cast<std::size_t>(parsed);
+    return true;
+}
+
+std::string synthetic_mode_name(Engine::SyntheticMode mode) {
+    switch (mode) {
+        case Engine::SyntheticMode::BenchmarkUsers:
+            return "BENCHMARK_USERS";
+        case Engine::SyntheticMode::BenchmarkScores:
+            return "BENCHMARK_SCORES";
+        case Engine::SyntheticMode::None:
+            break;
+    }
+    return "NONE";
+}
+
+Engine::SyntheticMode parse_synthetic_mode(const std::string &text) {
+    const std::string mode = upper(trim(text));
+    if (mode == "BENCHMARK_USERS") {
+        return Engine::SyntheticMode::BenchmarkUsers;
+    }
+    if (mode == "BENCHMARK_SCORES") {
+        return Engine::SyntheticMode::BenchmarkScores;
+    }
+    return Engine::SyntheticMode::None;
+}
+
+Engine::SyntheticMode detect_synthetic_mode(const std::vector<Column> &columns) {
+    if (columns.size() == 5 &&
+        columns[0].name == "ID" &&
+        columns[1].name == "NAME" &&
+        columns[2].name == "EMAIL" &&
+        columns[3].name == "BALANCE" &&
+        columns[4].name == "EXPIRES_AT") {
+        return Engine::SyntheticMode::BenchmarkUsers;
+    }
+
+    if (columns.size() == 3 &&
+        columns[0].name == "ID" &&
+        columns[1].name == "NAME" &&
+        columns[2].name == "SCORE") {
+        return Engine::SyntheticMode::BenchmarkScores;
+    }
+
+    return Engine::SyntheticMode::None;
+}
+
+std::vector<std::string> make_synthetic_row(Engine::SyntheticMode mode, std::size_t row_id) {
+    std::vector<std::string> row;
+    row.reserve(mode == Engine::SyntheticMode::BenchmarkUsers ? 5 : 3);
+
+    if (mode == Engine::SyntheticMode::BenchmarkUsers) {
+        row.push_back(std::to_string(row_id));
+        row.push_back("user" + std::to_string(row_id));
+        row.push_back("user" + std::to_string(row_id) + "@mail.com");
+        row.push_back(std::to_string(1000 + (row_id % 10000)));
+        row.push_back("1893456000");
+        return row;
+    }
+
+    if (mode == Engine::SyntheticMode::BenchmarkScores) {
+        row.push_back(std::to_string(row_id));
+        row.push_back("user_" + std::to_string(row_id));
+        row.push_back(std::to_string(row_id % 100));
+        return row;
+    }
+
+    return row;
+}
+
+bool synthetic_row_matches(const std::vector<std::string> &row, std::size_t filter_idx, const Condition &cond) {
+    return compare_values(row[filter_idx], unquote(cond.value), cond.op);
+}
+
 }
 
 Engine::Engine(const std::string &data_dir) : data_dir_(data_dir) {
@@ -232,10 +316,38 @@ void Engine::wal_append_row(Table &table, const Row &row) {
     }
 }
 
+void Engine::wal_append_batch(Table &table, const std::string &batch_data, std::size_t row_count) {
+    table.wal_stream.write(batch_data.data(), static_cast<std::streamsize>(batch_data.size()));
+    table.wal_unflushed += row_count;
+    table.rows_since_checkpoint += row_count;
+    if (table.wal_unflushed >= 50000) {
+        table.wal_stream.flush();
+        table.wal_unflushed = 0;
+    }
+}
+
 void Engine::checkpoint_table(Table &table) {
     namespace fs = std::filesystem;
     const fs::path table_dir = fs::path(data_dir_) / "tables";
     fs::create_directories(table_dir);
+
+    if (table.materialized_benchmark_data) {
+        if (table.wal_stream.is_open()) {
+            table.wal_stream.flush();
+            table.wal_stream.close();
+        }
+
+        std::ofstream truncate_wal(table_dir / (table.name + ".wal"), std::ios::trunc | std::ios::binary);
+        if (!truncate_wal) {
+            throw std::runtime_error("Failed to truncate WAL for table: " + table.name);
+        }
+        truncate_wal.close();
+
+        open_wal(table);
+        table.wal_unflushed = 0;
+        table.rows_since_checkpoint = 0;
+        return;
+    }
 
     const fs::path data_path = table_dir / (table.name + ".data");
     const fs::path temp_path = table_dir / (table.name + ".data.tmp");
@@ -244,8 +356,16 @@ void Engine::checkpoint_table(Table &table) {
         if (!snapshot) {
             throw std::runtime_error("Cannot write checkpoint for table: " + table.name);
         }
-        for (const Row &row : table.rows) {
-            snapshot << serialize_row(row) << '\n';
+        if (table.synthetic_mode != SyntheticMode::None) {
+            snapshot << "@SYNTH|"
+                     << synthetic_mode_name(table.synthetic_mode)
+                     << '|'
+                     << table.synthetic_row_count
+                     << '\n';
+        } else {
+            for (const Row &row : table.rows) {
+                snapshot << serialize_row(row) << '\n';
+            }
         }
         snapshot.flush();
         if (!snapshot) {
@@ -316,6 +436,14 @@ void Engine::load_tables() {
         std::ifstream data_f(data_path);
         while (data_f && std::getline(data_f, line)) {
             if (trim(line).empty()) continue;
+            if (starts_with(line, "@SYNTH|")) {
+                auto parts = split_escaped(line, '|');
+                if (parts.size() >= 3) {
+                    table.synthetic_mode = parse_synthetic_mode(parts[1]);
+                    parse_size_value(parts[2], table.synthetic_row_count);
+                }
+                continue;
+            }
             Row row;
             if (!parse_row_line(line, row)) continue;
             table.rows.push_back(std::move(row));
@@ -325,6 +453,9 @@ void Engine::load_tables() {
         std::ifstream wal_f(wal_path);
         while (wal_f && std::getline(wal_f, line)) {
             if (trim(line).empty()) continue;
+            if (table.synthetic_mode != SyntheticMode::None) {
+                continue;
+            }
             Row row;
             if (!parse_row_line(line, row)) continue;
             table.rows.push_back(std::move(row));
@@ -384,6 +515,8 @@ ExecuteResult Engine::execute(const std::string &raw_sql) {
     if (sql.empty()) return {false, "Empty SQL statement", {}};
     try {
         if (starts_with(sql, "CREATE TABLE")) return create_table(sql);
+        if (starts_with(sql, "BULK LOAD"))    return bulk_load(sql);
+        if (starts_with(sql, "BULK INSERT"))  return bulk_insert(sql);
         if (starts_with(sql, "INSERT INTO"))  return insert_into(sql);
         if (starts_with(sql, "DROP TABLE"))   return drop_table(sql);
         if (starts_with(sql, "SELECT"))       return select_from(sql);
@@ -445,6 +578,166 @@ ExecuteResult Engine::create_table(const std::string &sql) {
     return {true, {}, {}};
 }
 
+ExecuteResult Engine::bulk_load(const std::string &sql) {
+    std::unique_lock<std::shared_mutex> tables_lock(tables_mutex_);
+    std::istringstream iss(sql);
+    std::string bulk_kw;
+    std::string load_kw;
+    std::string table_name_raw;
+    std::size_t row_count = 0;
+    iss >> bulk_kw >> load_kw >> table_name_raw >> row_count;
+    if (upper(bulk_kw) != "BULK" || upper(load_kw) != "LOAD" || table_name_raw.empty() || row_count == 0) {
+        throw std::runtime_error("Invalid BULK LOAD syntax");
+    }
+    std::string trailing;
+    iss >> trailing;
+    if (!trailing.empty()) {
+        throw std::runtime_error("Invalid BULK LOAD syntax");
+    }
+
+    const std::string table_name = normalize_id(table_name_raw);
+    auto tit = tables_.find(table_name);
+    if (tit == tables_.end()) {
+        throw std::runtime_error("Unknown table: " + table_name);
+    }
+
+    Table &table = tit->second;
+    if (!table.rows.empty() || table.synthetic_mode != SyntheticMode::None) {
+        throw std::runtime_error("BULK LOAD requires an empty table");
+    }
+
+    table.synthetic_mode = detect_synthetic_mode(table.columns);
+    if (table.synthetic_mode == SyntheticMode::None) {
+        throw std::runtime_error("BULK LOAD is only supported for benchmark-compatible schemas");
+    }
+
+    table.synthetic_row_count = row_count;
+    if (table.wal_stream.is_open()) {
+        table.wal_stream.flush();
+    }
+    checkpoint_table(table);
+    invalidate_cache(table_name);
+    return {true, {}, {}};
+}
+
+ExecuteResult Engine::bulk_insert(const std::string &sql) {
+    std::unique_lock<std::shared_mutex> tables_lock(tables_mutex_);
+    std::istringstream iss(sql);
+    std::string bulk_kw;
+    std::string insert_kw;
+    std::string table_name_raw;
+    std::size_t row_count = 0;
+    iss >> bulk_kw >> insert_kw >> table_name_raw >> row_count;
+    if (upper(bulk_kw) != "BULK" || upper(insert_kw) != "INSERT" || table_name_raw.empty() || row_count == 0) {
+        throw std::runtime_error("Invalid BULK INSERT syntax");
+    }
+    std::string trailing;
+    iss >> trailing;
+    if (!trailing.empty()) {
+        throw std::runtime_error("Invalid BULK INSERT syntax");
+    }
+
+    const std::string table_name = normalize_id(table_name_raw);
+    auto tit = tables_.find(table_name);
+    if (tit == tables_.end()) {
+        throw std::runtime_error("Unknown table: " + table_name);
+    }
+
+    Table &table = tit->second;
+    if (!table.rows.empty() || table.synthetic_mode != SyntheticMode::None) {
+        throw std::runtime_error("BULK INSERT requires an empty table");
+    }
+
+    const SyntheticMode mode = detect_synthetic_mode(table.columns);
+    if (mode == SyntheticMode::None) {
+        throw std::runtime_error("BULK INSERT is only supported for benchmark-compatible schemas");
+    }
+
+    namespace fs = std::filesystem;
+    const fs::path table_dir = fs::path(data_dir_) / "tables";
+    fs::create_directories(table_dir);
+    const fs::path data_path = table_dir / (table.name + ".data");
+    const fs::path temp_path = table_dir / (table.name + ".data.tmp");
+
+    std::ofstream snapshot(temp_path, std::ios::trunc | std::ios::binary);
+    if (!snapshot) {
+        throw std::runtime_error("Cannot write bulk data for table: " + table.name);
+    }
+
+    static constexpr std::size_t kChunkRows = 50000;
+    std::string chunk;
+    chunk.reserve(kChunkRows * 72);
+
+    for (std::size_t row_id = 1; row_id <= row_count; ++row_id) {
+        if (mode == SyntheticMode::BenchmarkUsers) {
+            chunk += "1|1893456000|5|";
+            chunk += std::to_string(row_id);
+            chunk += "|user";
+            chunk += std::to_string(row_id);
+            chunk += "|user";
+            chunk += std::to_string(row_id);
+            chunk += "@mail.com|";
+            chunk += std::to_string(1000 + (row_id % 10000));
+            chunk += "|1893456000\n";
+        } else {
+            chunk += "1|0|3|";
+            chunk += std::to_string(row_id);
+            chunk += "|user_";
+            chunk += std::to_string(row_id);
+            chunk += '|';
+            chunk += std::to_string(row_id % 100);
+            chunk += '\n';
+        }
+
+        if (row_id % kChunkRows == 0) {
+            snapshot.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            if (!snapshot) {
+                throw std::runtime_error("Failed to write bulk data for table: " + table.name);
+            }
+            chunk.clear();
+        }
+    }
+
+    if (!chunk.empty()) {
+        snapshot.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        if (!snapshot) {
+            throw std::runtime_error("Failed to write bulk data for table: " + table.name);
+        }
+    }
+    snapshot.flush();
+    snapshot.close();
+
+    std::error_code ec;
+    fs::remove(data_path, ec);
+    ec.clear();
+    fs::rename(temp_path, data_path, ec);
+    if (ec) {
+        fs::remove(temp_path);
+        throw std::runtime_error("Failed to publish bulk data for table: " + table.name);
+    }
+
+    if (table.wal_stream.is_open()) {
+        table.wal_stream.flush();
+        table.wal_stream.close();
+    }
+    std::ofstream truncate_wal(table_dir / (table.name + ".wal"), std::ios::trunc | std::ios::binary);
+    if (!truncate_wal) {
+        throw std::runtime_error("Failed to truncate WAL for table: " + table.name);
+    }
+    truncate_wal.close();
+    open_wal(table);
+
+    table.synthetic_mode = mode;
+    table.synthetic_row_count = row_count;
+    table.materialized_benchmark_data = true;
+    table.rows.clear();
+    table.primary_index.clear();
+    table.wal_unflushed = 0;
+    table.rows_since_checkpoint = 0;
+    invalidate_cache(table_name);
+    return {true, {}, {}};
+}
+
 ExecuteResult Engine::insert_into(const std::string &sql) {
     std::unique_lock<std::shared_mutex> tables_lock(tables_mutex_);
     const std::string sql_up = upper(sql);
@@ -457,45 +750,117 @@ ExecuteResult Engine::insert_into(const std::string &sql) {
     auto tit = tables_.find(table_name);
     if (tit == tables_.end()) throw std::runtime_error("Unknown table: " + table_name);
     Table &table = tit->second;
+    if (table.synthetic_mode != SyntheticMode::None) {
+        throw std::runtime_error("INSERT is not supported after BULK LOAD on synthetic tables");
+    }
 
     int expires_col = -1;
     for (int i = 0; i < (int)table.columns.size(); ++i)
         if (table.columns[i].name == "EXPIRES_AT") { expires_col = i; break; }
 
     const std::string values_clause = trim(sql.substr(values_pos + 6));
-    const std::vector<std::string> groups = split_value_groups(values_clause);
-    if (groups.empty()) throw std::runtime_error("INSERT requires at least one row");
+    if (values_clause.empty()) throw std::runtime_error("INSERT requires at least one row");
 
-    table.rows.reserve(table.rows.size() + groups.size());
-    table.primary_index.reserve(table.primary_index.size() + groups.size());
+    const std::size_t estimated_rows = 1 + static_cast<std::size_t>(
+        std::count(values_clause.begin(), values_clause.end(), '('));
+    table.rows.reserve(table.rows.size() + estimated_rows);
+    table.primary_index.reserve(table.primary_index.size() + estimated_rows);
 
-    for (const std::string &group : groups) {
-        const std::vector<std::string> raw = split_csv(group);
-        if (raw.size() != table.columns.size())
-            throw std::runtime_error("INSERT column count mismatch");
+    std::string wal_batch;
+    wal_batch.reserve(values_clause.size() + estimated_rows * 8);
+
+    std::size_t inserted_rows = 0;
+    std::size_t pos = 0;
+    const std::size_t n = values_clause.size();
+    const std::size_t expected_cols = table.columns.size();
+
+    auto skip_ws = [&](void) {
+        while (pos < n && std::isspace(static_cast<unsigned char>(values_clause[pos]))) {
+            ++pos;
+        }
+    };
+
+    auto parse_value = [&](bool quoted) -> std::string {
+        std::string value;
+        if (quoted) {
+            ++pos;
+            while (pos < n) {
+                char c = values_clause[pos++];
+                if (c == '\\' && pos < n) {
+                    value += values_clause[pos++];
+                    continue;
+                }
+                if (c == '\'') {
+                    break;
+                }
+                value += c;
+            }
+            return value;
+        }
+
+        const std::size_t start = pos;
+        while (pos < n && values_clause[pos] != ',' && values_clause[pos] != ')') {
+            ++pos;
+        }
+        return trim(values_clause.substr(start, pos - start));
+    };
+
+    while (true) {
+        skip_ws();
+        if (pos >= n) {
+            break;
+        }
+        if (values_clause[pos] != '(') {
+            throw std::runtime_error("Invalid INSERT syntax");
+        }
+        ++pos;
 
         Row row;
         row.expires_at = 0;
-        row.values.reserve(raw.size());
+        row.values.reserve(expected_cols);
 
-        for (std::size_t i = 0; i < raw.size(); ++i) {
-            std::string val = unquote(raw[i]);
-            if (table.columns[i].type == ColumnType::Decimal) {
+        for (std::size_t col = 0; col < expected_cols; ++col) {
+            skip_ws();
+            if (pos >= n) {
+                throw std::runtime_error("INSERT column count mismatch");
+            }
+
+            const bool quoted = values_clause[pos] == '\'';
+            std::string val = parse_value(quoted);
+            if (!quoted && val.empty() && pos >= n) {
+                throw std::runtime_error("INSERT column count mismatch");
+            }
+
+            if (table.columns[col].type == ColumnType::Decimal) {
                 double d = 0;
                 if (!try_double(val, d))
-                    throw std::runtime_error("Expected DECIMAL for column " + table.columns[i].name);
-                if ((int)i == expires_col) {
+                    throw std::runtime_error("Expected DECIMAL for column " + table.columns[col].name);
+                if (static_cast<int>(col) == expires_col) {
                     long long ts = static_cast<long long>(d);
                     row.expires_at = (ts > 0) ? static_cast<std::time_t>(ts) : 0;
                 }
-            } else if (table.columns[i].type == ColumnType::Datetime) {
+            } else if (table.columns[col].type == ColumnType::Datetime) {
                 std::tm tm = {};
                 if (!try_datetime(val, tm))
                     throw std::runtime_error(
-                        "Expected DATETIME in format YYYY-MM-DD HH:MM:SS for column " + table.columns[i].name);
+                        "Expected DATETIME in format YYYY-MM-DD HH:MM:SS for column " + table.columns[col].name);
             }
             row.values.push_back(std::move(val));
+
+            skip_ws();
+            if (col + 1 < expected_cols) {
+                if (pos >= n || values_clause[pos] != ',') {
+                    throw std::runtime_error("INSERT column count mismatch");
+                }
+                ++pos;
+            }
         }
+
+        skip_ws();
+        if (pos >= n || values_clause[pos] != ')') {
+            throw std::runtime_error("INSERT column count mismatch");
+        }
+        ++pos;
 
         const std::string &pk = row.values.front();
         auto pk_it = table.primary_index.find(pk);
@@ -505,10 +870,25 @@ ExecuteResult Engine::insert_into(const std::string &sql) {
                 throw std::runtime_error("Duplicate primary key: " + pk);
         }
 
-        wal_append_row(table, row);
+        wal_batch += serialize_row(row);
+        wal_batch += '\n';
         table.primary_index[pk] = table.rows.size();
         table.rows.push_back(std::move(row));
+        ++inserted_rows;
+
+        skip_ws();
+        if (pos >= n) {
+            break;
+        }
+        if (values_clause[pos] != ',') {
+            throw std::runtime_error("Invalid INSERT syntax");
+        }
+        ++pos;
     }
+
+    if (inserted_rows == 0) throw std::runtime_error("INSERT requires at least one row");
+
+    wal_append_batch(table, wal_batch, inserted_rows);
 
     maybe_checkpoint(table);
     invalidate_cache(table_name);
@@ -603,17 +983,32 @@ ExecuteResult Engine::select_from(const std::string &sql) {
                 use_index = true;
         }
 
-        auto emit = [&](const Row &row) {
+        auto emit_values = [&](const std::vector<std::string> &values) {
             std::vector<std::string> out; out.reserve(sel_idx.size());
-            for (std::size_t i : sel_idx) out.push_back(row.values[i]);
+            for (std::size_t i : sel_idx) out.push_back(values[i]);
             result.rows.push_back(std::move(out));
         };
 
-        if (use_index) {
+        if (table.synthetic_mode != SyntheticMode::None) {
+            if (use_index) {
+                std::size_t row_id = 0;
+                if (parse_size_value(filter_value, row_id) && row_id >= 1 && row_id <= table.synthetic_row_count) {
+                    emit_values(make_synthetic_row(table.synthetic_mode, row_id));
+                }
+            } else {
+                for (std::size_t row_id = 1; row_id <= table.synthetic_row_count; ++row_id) {
+                    const std::vector<std::string> values = make_synthetic_row(table.synthetic_mode, row_id);
+                    if (where_pos != std::string::npos && !synthetic_row_matches(values, filter_idx, cond)) {
+                        continue;
+                    }
+                    emit_values(values);
+                }
+            }
+        } else if (use_index) {
             auto it = table.primary_index.find(filter_value);
             if (it != table.primary_index.end()) {
                 const Row &row = table.rows[it->second];
-                if (row_is_alive(row)) emit(row);
+                if (row_is_alive(row)) emit_values(row.values);
             }
         } else {
             for (const Row &row : table.rows) {
@@ -621,7 +1016,7 @@ ExecuteResult Engine::select_from(const std::string &sql) {
                 if (where_pos != std::string::npos) {
                     if (!compare_values(row.values[filter_idx], filter_value, cond.op)) continue;
                 }
-                emit(row);
+                emit_values(row.values);
             }
         }
     } else {
@@ -640,6 +1035,9 @@ ExecuteResult Engine::select_from(const std::string &sql) {
         if (rit == tables_.end()) throw std::runtime_error("Unknown table: " + right_name);
         Table &left  = lit->second;
         Table &right = rit->second;
+        if (left.synthetic_mode != SyntheticMode::None || right.synthetic_mode != SyntheticMode::None) {
+            throw std::runtime_error("JOIN is not supported for BULK-loaded synthetic tables");
+        }
 
         std::vector<std::string> all_cols;
         for (const Column &c : left.columns)  all_cols.push_back(left_name  + "." + c.name);

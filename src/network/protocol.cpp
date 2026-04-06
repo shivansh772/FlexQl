@@ -1,4 +1,4 @@
-#include "protocol.hpp"
+#include "network/protocol.hpp"
 
 #include <sys/socket.h>
 #include <unistd.h>

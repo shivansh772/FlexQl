@@ -9,7 +9,7 @@
 #include <cstring>
 #include <string>
 
-#include "protocol.hpp"
+#include "network/protocol.hpp"
 
 struct FlexQL {
     int socket_fd;

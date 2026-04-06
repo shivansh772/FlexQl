@@ -125,11 +125,14 @@ Notes:
 ## Files
 
 - `include/flexql.h`: public C API
-- `src/api.cpp`: API implementation
-- `src/engine.cpp`: parser and in-memory database engine
-- `src/protocol.cpp`: socket protocol helpers
-- `src/server_main.cpp`: server executable
-- `src/client_main.cpp`: interactive REPL client
+- `include/storage/engine.hpp`: engine data structures and execution interface
+- `include/network/protocol.hpp`: socket protocol helpers
+- `src/client/api.cpp`: API implementation
+- `src/storage/engine.cpp`: parser and in-memory database engine
+- `src/network/protocol.cpp`: socket protocol helpers
+- `src/server/server_main.cpp`: server executable
+- `src/client/client_main.cpp`: interactive REPL client
+- `src/client/benchmark_main.cpp`: API benchmark client
 - `benchmarks/benchmark_flexql.cpp`: integrated benchmark file from the supplied repository
 - `DESIGN.md`: design document
 - `PERFORMANCE.md`: sample measured benchmark result

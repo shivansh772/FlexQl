@@ -10,8 +10,8 @@
 #include <thread>
 #include <string>
 
-#include "engine.hpp"
-#include "protocol.hpp"
+#include "storage/engine.hpp"
+#include "network/protocol.hpp"
 
 namespace {
 

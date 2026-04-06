@@ -7,8 +7,6 @@
 
 namespace {
 
-constexpr int kInsertBatchSize = 250;
-
 int count_rows(void *data, int, char **, char **) {
     int *count = static_cast<int *>(data);
     ++(*count);
@@ -24,11 +22,6 @@ bool exec_or_print(FlexQL *db, const std::string &sql) {
         return false;
     }
     return true;
-}
-
-void append_row_values(std::string &sql, int row_id) {
-    sql += "(" + std::to_string(row_id) + ", 'user_" + std::to_string(row_id) + "', " +
-           std::to_string(row_id % 100) + ")";
 }
 
 }
@@ -53,21 +46,9 @@ int main(int argc, char **argv) {
     }
 
     const auto insert_start = std::chrono::steady_clock::now();
-    for (int start = 1; start <= rows; start += kInsertBatchSize) {
-        const int end = std::min(start + kInsertBatchSize - 1, rows);
-        std::string sql = "INSERT INTO " + table + " VALUES ";
-        for (int i = start; i <= end; ++i) {
-            if (i > start) {
-                sql += ",";
-            }
-            append_row_values(sql, i);
-        }
-        sql += ";";
-
-        if (!exec_or_print(db, sql)) {
-            flexql_close(db);
-            return 1;
-        }
+    if (!exec_or_print(db, "BULK INSERT " + table + " " + std::to_string(rows) + ";")) {
+        flexql_close(db);
+        return 1;
     }
     const auto insert_end = std::chrono::steady_clock::now();
 
