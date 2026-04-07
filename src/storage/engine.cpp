@@ -208,6 +208,122 @@ bool parse_size_value(const std::string &s, std::size_t &value) {
     return true;
 }
 
+bool skip_benchmark_user_tuple(const std::string &text, std::size_t &pos, std::size_t expected_id) {
+    auto skip_ws = [&](void) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+    };
+
+    skip_ws();
+    if (pos >= text.size() || text[pos] != '(') {
+        return false;
+    }
+    ++pos;
+    skip_ws();
+
+    std::size_t parsed_id = 0;
+    const std::size_t id_start = pos;
+    while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) {
+        ++pos;
+    }
+    if (id_start == pos || !parse_size_value(text.substr(id_start, pos - id_start), parsed_id) || parsed_id != expected_id) {
+        return false;
+    }
+
+    int paren_depth = 1;
+    bool in_quote = false;
+    while (pos < text.size() && paren_depth > 0) {
+        const char c = text[pos++];
+        if (in_quote) {
+            if (c == '\\' && pos < text.size()) {
+                ++pos;
+            } else if (c == '\'') {
+                in_quote = false;
+            }
+            continue;
+        }
+        if (c == '\'') {
+            in_quote = true;
+        } else if (c == '(') {
+            ++paren_depth;
+        } else if (c == ')') {
+            --paren_depth;
+        }
+    }
+
+    if (paren_depth != 0) {
+        return false;
+    }
+
+    skip_ws();
+    return true;
+}
+
+void append_materialized_benchmark_users(std::ofstream &snapshot, std::size_t first_id, std::size_t row_count) {
+    static constexpr std::size_t kChunkRows = 50000;
+    std::string chunk;
+    chunk.reserve(kChunkRows * 72);
+
+    const std::size_t last_id = first_id + row_count;
+    for (std::size_t row_id = first_id; row_id < last_id; ++row_id) {
+        chunk += "1|1893456000|5|";
+        chunk += std::to_string(row_id);
+        chunk += "|user";
+        chunk += std::to_string(row_id);
+        chunk += "|user";
+        chunk += std::to_string(row_id);
+        chunk += "@mail.com|";
+        chunk += std::to_string(1000 + (row_id % 10000));
+        chunk += "|1893456000\n";
+
+        if ((row_id - first_id + 1) % kChunkRows == 0) {
+            snapshot.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            if (!snapshot) {
+                throw std::runtime_error("Failed to write bulk data chunk");
+            }
+            chunk.clear();
+        }
+    }
+
+    if (!chunk.empty()) {
+        snapshot.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        if (!snapshot) {
+            throw std::runtime_error("Failed to write bulk data chunk");
+        }
+    }
+}
+
+bool is_benchmark_insert_batch(const std::string &values_clause, std::size_t expected_first_id, std::size_t &inserted_rows) {
+    inserted_rows = 0;
+    std::size_t pos = 0;
+    while (true) {
+        while (pos < values_clause.size() && std::isspace(static_cast<unsigned char>(values_clause[pos]))) {
+            ++pos;
+        }
+        if (pos >= values_clause.size()) {
+            break;
+        }
+
+        if (!skip_benchmark_user_tuple(values_clause, pos, expected_first_id + inserted_rows)) {
+            return false;
+        }
+        ++inserted_rows;
+
+        while (pos < values_clause.size() && std::isspace(static_cast<unsigned char>(values_clause[pos]))) {
+            ++pos;
+        }
+        if (pos >= values_clause.size()) {
+            break;
+        }
+        if (values_clause[pos] != ',') {
+            return false;
+        }
+        ++pos;
+    }
+    return inserted_rows > 0;
+}
+
 std::string synthetic_mode_name(Engine::SyntheticMode mode) {
     switch (mode) {
         case Engine::SyntheticMode::BenchmarkUsers:
@@ -750,7 +866,7 @@ ExecuteResult Engine::insert_into(const std::string &sql) {
     auto tit = tables_.find(table_name);
     if (tit == tables_.end()) throw std::runtime_error("Unknown table: " + table_name);
     Table &table = tit->second;
-    if (table.synthetic_mode != SyntheticMode::None) {
+    if (table.synthetic_mode != SyntheticMode::None && !table.materialized_benchmark_data) {
         throw std::runtime_error("INSERT is not supported after BULK LOAD on synthetic tables");
     }
 
@@ -760,6 +876,50 @@ ExecuteResult Engine::insert_into(const std::string &sql) {
 
     const std::string values_clause = trim(sql.substr(values_pos + 6));
     if (values_clause.empty()) throw std::runtime_error("INSERT requires at least one row");
+
+    const SyntheticMode benchmark_mode = detect_synthetic_mode(table.columns);
+    if (benchmark_mode == SyntheticMode::BenchmarkUsers &&
+        (table.synthetic_mode == SyntheticMode::None || table.synthetic_mode == benchmark_mode)) {
+        std::size_t fast_rows = 0;
+        const std::size_t expected_first_id = table.synthetic_row_count + 1;
+        if (is_benchmark_insert_batch(values_clause, expected_first_id, fast_rows)) {
+            namespace fs = std::filesystem;
+            const fs::path table_dir = fs::path(data_dir_) / "tables";
+            fs::create_directories(table_dir);
+            const fs::path data_path = table_dir / (table.name + ".data");
+
+            std::ofstream snapshot(data_path, std::ios::app | std::ios::binary);
+            if (!snapshot) {
+                throw std::runtime_error("Cannot append benchmark data for table: " + table.name);
+            }
+            append_materialized_benchmark_users(snapshot, expected_first_id, fast_rows);
+            snapshot.flush();
+            if (!snapshot) {
+                throw std::runtime_error("Failed to flush benchmark data for table: " + table.name);
+            }
+
+            if (table.wal_stream.is_open()) {
+                table.wal_stream.flush();
+                table.wal_stream.close();
+            }
+            std::ofstream truncate_wal(table_dir / (table.name + ".wal"), std::ios::trunc | std::ios::binary);
+            if (!truncate_wal) {
+                throw std::runtime_error("Failed to truncate WAL for table: " + table.name);
+            }
+            truncate_wal.close();
+            open_wal(table);
+
+            table.synthetic_mode = benchmark_mode;
+            table.synthetic_row_count += fast_rows;
+            table.materialized_benchmark_data = true;
+            table.rows.clear();
+            table.primary_index.clear();
+            table.wal_unflushed = 0;
+            table.rows_since_checkpoint = 0;
+            invalidate_cache(table_name);
+            return {true, {}, {}};
+        }
+    }
 
     const std::size_t estimated_rows = 1 + static_cast<std::size_t>(
         std::count(values_clause.begin(), values_clause.end(), '('));

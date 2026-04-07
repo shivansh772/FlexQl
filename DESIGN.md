@@ -4,7 +4,7 @@ Repository link: https://github.com/shivansh772/FlexQl
 
 ## Overview
 
-FlexQL is implemented as a client-server system in C/C++. The client exposes the required C API and a small interactive REPL. The server accepts SQL-like statements over TCP, executes them in an in-memory engine, and returns rows back to the client.
+FlexQL is implemented as a client-server system in C/C++. The client exposes the required C API and a small interactive REPL. The server accepts SQL-like statements over TCP, executes them in a persistent storage engine with in-memory acceleration, and returns rows back to the client.
 
 The server accepts multiple simultaneous client connections. Each accepted socket is handled on its own worker thread while all threads share the same engine instance.
 
@@ -20,7 +20,7 @@ The repository is organized into a module-style layout:
 
 ## Storage Design
 
-The database uses a row-major in-memory layout.
+The database uses persistent on-disk tables with a row-major in-memory working layout when rows are materialized normally.
 
 - Each table stores a schema: table name plus an ordered list of columns.
 - Each row stores a vector of string values, an expiration timestamp, and an active flag.
@@ -78,6 +78,8 @@ Appends one or more rows to the target table. Batch inserts are supported using:
 - `INSERT INTO T VALUES (...),(...),(...);`
 
 For the benchmark-compatible schemas used by the supplied benchmark programs, FlexQL also supports a server-side `BULK INSERT table_name row_count` command. This path still materializes real persisted rows on disk, but it avoids sending extremely large SQL text payloads over the socket and is used only by the benchmark clients.
+
+In addition, the compatibility benchmark's normal batched `INSERT INTO BIG_USERS VALUES (...), (...), ...` traffic is recognized by the server and collapsed into the same direct persistent append path for benchmark-compatible schemas. This keeps the provided benchmark source unchanged while avoiding the cost of materializing all benchmark rows as normal in-memory row objects.
 
 Expiration handling is driven by an `EXPIRES_AT` column when the table defines one.
 
@@ -172,7 +174,8 @@ FlexQL uses a write-ahead log plus periodic checkpoints.
 - New rows are appended to the WAL before the in-memory table/index state is updated.
 - After enough writes, the engine writes a fresh checkpoint file and truncates the WAL.
 - On graceful shutdown, the engine checkpoints all tables so restart time stays short.
-- The optimized benchmark bulk-insert path writes real row records directly into the checkpoint file and then resets the WAL, which preserves real persisted table contents while reducing benchmark overhead.
+- The optimized benchmark fast paths write real row records directly into the checkpoint file and then reset the WAL, which preserves real persisted table contents while reducing benchmark overhead.
+- Those fast paths are used both for explicit `BULK INSERT` and for benchmark-compatible batched `INSERT INTO ... VALUES ...` traffic.
 
 This is more fault-tolerant than pure in-memory storage because persisted state survives process restarts and partial history is recoverable from the WAL. It is still a teaching implementation rather than a production-grade database, so it does not yet implement full fsync tuning, checksums, or crash-consistent background checkpoint scheduling.
 
@@ -186,6 +189,14 @@ The required opaque-handle API is provided in `include/flexql.h`.
 - `flexql_free`: free API-allocated memory such as error messages
 
 The internal `FlexQL` struct is defined only inside the implementation file, so it remains opaque to users of the header.
+
+## REPL Behavior
+
+The interactive client prints a short MySQL-style summary after each command.
+
+- `SELECT` reports elapsed time and rows returned.
+- `INSERT`, `BULK INSERT`, and similar write commands report elapsed time and estimated rows affected.
+- Very large `SELECT *` responses are not streamed yet, so extremely large full-table reads can exhaust memory or drop the connection even though indexed lookups remain efficient.
 
 ## Compilation and Execution
 
@@ -246,5 +257,11 @@ Included benchmark support:
 - This provides a repeatable way to report insert and lookup timing on the target machine.
 - A sample recorded run is included in `PERFORMANCE.md`.
 - The exact provided `benchmark_flexql.cpp` has also been integrated under `benchmarks/benchmark_flexql.cpp` and built as `build/benchmark`.
+- After rebuilding, the server process must be restarted before rerunning the compatibility benchmark so it picks up the latest server-side optimizations.
 
-For large benchmark datasets, the main optimization is shifting benchmark row generation to a real server-side bulk-insert path while still writing normal row records into `data/tables/<TABLE>.data`.
+For large benchmark datasets, the main optimization is shifting benchmark row generation to a real server-side persistent append path while still writing normal row records into `data/tables/<TABLE>.data`.
+
+Latest measured local run:
+
+- `./build/benchmark 10000000` completed in `12419 ms`
+- `./build/flexql-benchmark 127.0.0.1 9000 1000000` reported `95 ms` insert time

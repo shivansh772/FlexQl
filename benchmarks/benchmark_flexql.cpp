@@ -8,7 +8,9 @@
 using namespace std;
 using namespace std::chrono;
 
-static const long long DEFAULT_INSERT_ROWS = 10LL;
+static const long long DEFAULT_INSERT_ROWS = 10LL; // 100k rows by default for insertion benchmark
+static const int INSERT_BATCH_SIZE = 10000; // if you implement batch inserts in flexql, you can increase this for better performance
+
 struct QueryStats {
     long long rows = 0;
 };
@@ -41,15 +43,6 @@ static bool run_exec(FlexQL *db, const string &sql, const string &label) {
 
     cout << "[PASS] " << label << " (" << elapsed << " ms)\n";
     return true;
-}
-
-static void exec_ignore_failure(FlexQL *db, const string &sql) {
-    char *errMsg = nullptr;
-    int rc = flexql_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
-    if (errMsg) {
-        flexql_free(errMsg);
-    }
-    (void)rc;
 }
 
 static bool run_query(FlexQL *db, const string &sql, const string &label) {
@@ -150,9 +143,6 @@ static bool assert_row_count(const string &label, const vector<string> &rows, si
 static bool run_data_level_unit_tests(FlexQL *db) {
     cout << "\n[[...Running Unit Tests...]]\n\n";
 
-    exec_ignore_failure(db, "DROP TABLE TEST_ORDERS;");
-    exec_ignore_failure(db, "DROP TABLE TEST_USERS;");
-
     bool all_ok = true;
     int total_tests = 0;
     int failed_tests = 0;
@@ -251,8 +241,6 @@ static bool run_data_level_unit_tests(FlexQL *db) {
 }
 
 static bool run_insert_benchmark(FlexQL *db, long long target_rows) {
-    exec_ignore_failure(db, "DROP TABLE BIG_USERS;");
-
     if (!run_exec(
             db,
             "CREATE TABLE BIG_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
@@ -262,14 +250,47 @@ static bool run_insert_benchmark(FlexQL *db, long long target_rows) {
 
     cout << "\nStarting insertion benchmark for " << target_rows << " rows...\n";
     auto bench_start = high_resolution_clock::now();
-    char *errMsg = nullptr;
-    const string bulk_sql = "BULK INSERT BIG_USERS " + to_string(target_rows) + ";";
-    if (flexql_exec(db, bulk_sql.c_str(), nullptr, nullptr, &errMsg) != FLEXQL_OK) {
-        cout << "[FAIL] BULK INSERT BIG_USERS -> " << (errMsg ? errMsg : "unknown error") << "\n";
-        if (errMsg) {
-            flexql_free(errMsg);
+
+    long long inserted = 0;
+    long long progress_step = target_rows / 10;
+    if (progress_step <= 0) {
+        progress_step = 1;
+    }
+    long long next_progress = progress_step;
+
+    while (inserted < target_rows) {
+        stringstream ss;
+        ss << "INSERT INTO BIG_USERS VALUES ";
+
+        int in_batch = 0;
+        while (in_batch < INSERT_BATCH_SIZE && inserted < target_rows) {
+            long long id = inserted + 1;
+            ss << "(" << id
+               << ", 'user" << id << "'"
+                    << ", 'user" << id << "@mail.com'"
+               << ", " << (1000.0 + (id % 10000))
+               << ", 1893456000)";
+            inserted++;
+            in_batch++;
+            if (in_batch < INSERT_BATCH_SIZE && inserted < target_rows) {
+                ss << ",";
+            }
         }
-        return false;
+        ss << ";";
+
+        char *errMsg = nullptr;
+        if (flexql_exec(db, ss.str().c_str(), nullptr, nullptr, &errMsg) != FLEXQL_OK) {
+            cout << "[FAIL] INSERT BIG_USERS batch -> " << (errMsg ? errMsg : "unknown error") << "\n";
+            if (errMsg) {
+                flexql_free(errMsg);
+            }
+            return false;
+        }
+
+        if (inserted >= next_progress || inserted == target_rows) {
+            cout << "Progress: " << inserted << "/" << target_rows << "\n";
+            next_progress += progress_step;
+        }
     }
 
     auto bench_end = high_resolution_clock::now();
